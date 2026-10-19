@@ -1,0 +1,108 @@
+"""Cyber and data-security controls (v0.11).
+
+Research control plane with expanded redaction (incl. more key formats and entropy proxy), multi-hash, and integrity helpers.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+
+from crypto_intel.models import AuditEvent, ExecutionMode
+
+SECRET_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key|secret|password|token|bearer|private[_-]?key|mnemonic|seed)\s*[:=]\s*['\"]?[A-Za-z0-9_\-\.\s]{12,}"),
+    re.compile(r"\b(?:sk|pk)_(?:live|test)_[A-Za-z0-9]{8,}\b"),
+    re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+    re.compile(r"(?i)(mongodb|postgres|mysql|redis|amqp)://[^\s]+"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),  # JWT
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),  # base64-like long strings
+    re.compile(r"\b[0-9a-fA-F]{64}\b"),  # potential private key hex
+    re.compile(r"(?i)(-----BEGIN (RSA |EC )?PRIVATE KEY-----)"),  # PEM private keys
+)
+
+WALLET_PATTERN = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
+
+
+@dataclass(frozen=True)
+class DataClassification:
+    field: str
+    level: str
+    retention: str
+
+
+CLASSIFICATION = (
+    DataClassification("symbol", "public", "research retention"),
+    DataClassification("ohlcv", "public-market", "research retention"),
+    DataClassification("exchange_api_key", "secret", "never stored"),
+    DataClassification("wallet_address", "sensitive-identifier", "do not fixture"),
+    DataClassification("account_email", "personal", "do not collect"),
+)
+
+
+def redact(text: str) -> str:
+    cleaned = text
+    for pattern in SECRET_PATTERNS:
+        cleaned = pattern.sub("[REDACTED]", cleaned)
+    return WALLET_PATTERN.sub("[WALLET]", cleaned)
+
+
+def contains_secret(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_PATTERNS) or bool(WALLET_PATTERN.search(text))
+
+
+def entropy_proxy(text: str) -> float:
+    """Simple character entropy proxy for secret detection research."""
+    if not text:
+        return 0.0
+    from collections import Counter
+    counts = Counter(text)
+    probs = [c / len(text) for c in counts.values()]
+    import math
+    return -sum(p * math.log2(p) for p in probs if p > 0)
+
+
+def assert_paper_only(mode: ExecutionMode) -> None:
+    if mode is not ExecutionMode.PAPER:
+        raise PermissionError("live execution is disabled; this system is paper-only")
+
+
+def hash_event(previous_hash: str, sequence: int, action: str, detail: str) -> str:
+    material = f"{previous_hash}|{sequence}|{action}|{detail}".encode()
+    return hashlib.sha256(material).hexdigest()
+
+
+def multi_hash(body: str) -> dict[str, str]:
+    """Research multi-hash for fixture integrity."""
+    return {
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "sha1": hashlib.sha1(body.encode()).hexdigest(),
+        "md5": hashlib.md5(body.encode()).hexdigest(),
+    }
+
+
+class AuditLog:
+    """Append-only hash chain. Tampering changes the next digest."""
+
+    def __init__(self) -> None:
+        self.events: list[AuditEvent] = []
+        self._previous = "GENESIS"
+
+    def append(self, action: str, detail: str) -> AuditEvent:
+        safe_detail = redact(detail)
+        sequence = len(self.events) + 1
+        digest = hash_event(self._previous, sequence, action, safe_detail)
+        event = AuditEvent(sequence, action, safe_detail, self._previous, digest)
+        self.events.append(event)
+        self._previous = digest
+        return event
+
+    def verify(self) -> bool:
+        previous = "GENESIS"
+        for event in self.events:
+            expected = hash_event(previous, event.sequence, event.action, event.detail)
+            if event.previous_hash != previous or event.digest != expected:
+                return False
+            previous = event.digest
+        return True
